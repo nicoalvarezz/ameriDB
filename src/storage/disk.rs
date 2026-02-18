@@ -1,0 +1,153 @@
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+pub const DEFAULT_PAGE_SIZE: usize = 4096;
+const DB_MAGIC: [u8; 4] = *b"AMDB";
+const DB_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PageId(pub u64);
+
+#[derive(Debug, Clone)]
+pub struct Page {
+    pub id: PageId,
+    pub data: Vec<u8>,
+}
+
+impl Page {
+    pub fn new(id: PageId, page_size: usize) -> Self {
+        Self {
+            id,
+            data: vec![0u8; page_size],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PageHeader {
+    pub magic: [u8; 4],
+    pub version: u16,
+    pub page_size: u32,
+    pub next_page_id: u64,
+}
+
+impl PageHeader {
+    pub const SIZE: usize = 4 + 2 + 4 + 8;
+
+    pub fn new(page_size: u32, next_page_id: u64) -> Self {
+        Self {
+            magic: DB_MAGIC,
+            version: DB_VERSION,
+            page_size,
+            next_page_id,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..4].copy_from_slice(&self.magic);
+        buf[4..6].copy_from_slice(&self.version.to_le_bytes());
+        buf[6..10].copy_from_slice(&self.page_size.to_be_bytes());
+        buf[10..18].copy_from_slice(&self.next_page_id.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8; Self::SIZE]) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        magic.copy_from_slice(&buf[0..4]);
+        let version = u16::from_le_bytes([buf[4], buf[5]]);
+        let page_size = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]);
+        let next_page_id = u64::from_le_bytes([
+            buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
+        ]);
+
+        Ok(Self {
+            magic,
+            version,
+            page_size,
+            next_page_id,
+        })
+    }
+}
+
+pub struct StorageManager {
+    file: File,
+    path: PathBuf,
+    page_size: usize,
+    next_page_id: PageId,
+}
+
+impl StorageManager {
+    pub fn open(path: impl AsRef<Path>, page_size: usize) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)?;
+
+        let file_len = file.metadata()?.len();
+        if file_len == 0 {
+            let header = PageHeader::new(page_size as u32, 0);
+            file.write_all(&header.to_bytes())?;
+            file.flush()?;
+            return Ok(Self {
+                file,
+                path,
+                page_size,
+                next_page_id: PageId(0),
+            });
+        }
+
+        let mut buf = [0u8; PageHeader::SIZE];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut buf)?;
+        let header = PageHeader::from_bytes(&buf)?;
+        if header.magic != DB_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalide datbaase header magic",
+            ));
+        }
+        if header.version != DB_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsuported database version",
+            ));
+        }
+
+        Ok(Self {
+            file,
+            path,
+            page_size,
+            next_page_id: PageId(header.next_page_id),
+        })
+    }
+
+    pub fn read_page(&mut self, page_id: PageId) -> io::Result<Page> {
+        let mut page = Page::new(page_id, self.page_size);
+        let offset = self.page_offset(page_id);
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(&mut page.data)?;
+        Ok(page)
+    }
+
+    pub fn write_page(&mut self, page: &Page) -> io::Result<()> {
+        if page.data.len() != self.page_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "page size mismatch",
+            ));
+        }
+
+        let offset = self.page_offset(page.id);
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write(&page.data)?;
+        Ok(())
+    }
+
+    fn page_offset(&self, page_id: PageId) -> u64 {
+        page_id.0 * self.page_size as u64
+    }
+}
