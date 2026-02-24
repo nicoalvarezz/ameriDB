@@ -102,13 +102,7 @@ impl StorageManager {
 
         let file_len = file.metadata()?.len();
         if file_len == 0 {
-            let page_size_u32 = u32::try_from(page_size).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "page size exceeds u32::MAX and cannot be serialized",
-                )
-            })?;
-            let header = PageHeader::new(page_size_u32, 0);
+            let header = PageHeader::new(page_size as u32, 0);
             file.write_all(&header.to_bytes())?;
             file.flush()?;
             file.sync_data()?;
