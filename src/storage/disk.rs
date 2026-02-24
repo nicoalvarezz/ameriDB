@@ -48,7 +48,7 @@ impl PageHeader {
         let mut buf = [0u8; Self::SIZE];
         buf[0..4].copy_from_slice(&self.magic);
         buf[4..6].copy_from_slice(&self.version.to_le_bytes());
-        buf[6..10].copy_from_slice(&self.page_size.to_be_bytes());
+        buf[6..10].copy_from_slice(&self.page_size.to_le_bytes());
         buf[10..18].copy_from_slice(&self.next_page_id.to_le_bytes());
         buf
     }
@@ -92,6 +92,7 @@ impl StorageManager {
             let header = PageHeader::new(page_size as u32, 0);
             file.write_all(&header.to_bytes())?;
             file.flush()?;
+            file.sync_data()?;
             return Ok(Self {
                 file,
                 path,
@@ -120,7 +121,7 @@ impl StorageManager {
         Ok(Self {
             file,
             path,
-            page_size,
+            page_size: header.page_size as usize,
             next_page_id: PageId(header.next_page_id),
         })
     }
@@ -143,11 +144,41 @@ impl StorageManager {
 
         let offset = self.page_offset(page.id);
         self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write(&page.data)?;
+        self.file.write_all(&page.data)?;
+        Ok(())
+    }
+
+    pub fn allocate_page(&mut self) -> io::Result<PageId> {
+        // reserve physical space for page in the file
+        let start = self.page_offset(self.next_page_id);
+        self.file.seek(SeekFrom::Start(start))?;
+        self.file.write_all(&vec![0u8; self.page_size])?;
+
+        // Advance the next page id
+        let allocated_page = self.next_page_id;
+        self.next_page_id = PageId(self.next_page_id.0 + 1);
+        
+        // persist header after page id has been advanced
+        self.persist_header()?;
+
+        Ok(allocated_page)
+    }
+    
+    pub fn page_size(&self) -> io::Result<usize> {
+        Ok(self.page_size)
+    }    
+    fn persist_header(&mut self) -> io::Result<()> {
+        let header = PageHeader::new(self.page_size as u32, self.next_page_id.0 as u64);
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&header.to_bytes())?;
+        self.file.flush()?;
+        self.file.sync_data()?;
         Ok(())
     }
 
     fn page_offset(&self, page_id: PageId) -> u64 {
-        page_id.0 * self.page_size as u64
+        PageHeader::SIZE as u64 + (page_id.0 * self.page_size as u64)
     }
+
+        
 }
