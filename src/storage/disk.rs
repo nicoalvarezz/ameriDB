@@ -80,6 +80,19 @@ pub struct StorageManager {
 
 impl StorageManager {
     pub fn open(path: impl AsRef<Path>, page_size: usize) -> io::Result<Self> {
+        if page_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "page size must be greater than 0",
+            ));
+        }
+        if page_size > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "page size exceeds u32::MAX and cannot be serialized",
+            ));
+        }
+
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
             .read(true)
@@ -89,7 +102,13 @@ impl StorageManager {
 
         let file_len = file.metadata()?.len();
         if file_len == 0 {
-            let header = PageHeader::new(page_size as u32, 0);
+            let page_size_u32 = u32::try_from(page_size).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "page size exceeds u32::MAX and cannot be serialized",
+                )
+            })?;
+            let header = PageHeader::new(page_size_u32, 0);
             file.write_all(&header.to_bytes())?;
             file.flush()?;
             file.sync_data()?;
@@ -117,6 +136,12 @@ impl StorageManager {
                 "unsuported database version",
             ));
         }
+        if header.page_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid database header page size: 0",
+            ));
+        }
 
         Ok(Self {
             file,
@@ -139,6 +164,12 @@ impl StorageManager {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "page size mismatch",
+            ));
+        }
+        if page.id.0 >= self.next_page_id.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot write to an unallocated page id",
             ));
         }
 
