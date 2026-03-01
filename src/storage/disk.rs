@@ -147,7 +147,7 @@ impl StorageManager {
 
     pub fn read_page(&mut self, page_id: PageId) -> io::Result<Page> {
         let mut page = Page::new(page_id, self.page_size);
-        let offset = self.page_offset(page_id);
+        let offset = self.page_offset(page_id)?;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(&mut page.data)?;
         Ok(page)
@@ -167,7 +167,7 @@ impl StorageManager {
             ));
         }
 
-        let offset = self.page_offset(page.id);
+        let offset = self.page_offset(page.id)?;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&page.data)?;
         Ok(())
@@ -175,7 +175,7 @@ impl StorageManager {
 
     pub fn allocate_page(&mut self) -> io::Result<PageId> {
         // reserve physical space for page in the file
-        let start = self.page_offset(self.next_page_id);
+        let start = self.page_offset(self.next_page_id)?;
         self.file.seek(SeekFrom::Start(start))?;
         self.file.write_all(&vec![0u8; self.page_size])?;
 
@@ -184,7 +184,10 @@ impl StorageManager {
         self.next_page_id = PageId(self.next_page_id.0 + 1);
         
         // persist header after page id has been advanced
-        self.persist_header()?;
+        if let Err(e) = self.persist_header() {
+            self.next_page_id = allocated_page;
+            return Err(e);
+        }
 
         Ok(allocated_page)
     }
@@ -192,6 +195,7 @@ impl StorageManager {
     pub fn page_size(&self) -> io::Result<usize> {
         Ok(self.page_size)
     }    
+
     fn persist_header(&mut self) -> io::Result<()> {
         let header = PageHeader::new(self.page_size as u32, self.next_page_id.0 as u64);
         self.file.seek(SeekFrom::Start(0))?;
@@ -201,8 +205,14 @@ impl StorageManager {
         Ok(())
     }
 
-    fn page_offset(&self, page_id: PageId) -> u64 {
-        PageHeader::SIZE as u64 + (page_id.0 * self.page_size as u64)
+    fn page_offset(&self, page_id: PageId) -> io::Result<u64> {
+        let page_size = self.page_size as u64;
+        page_id.0
+            .checked_mul(page_size)
+            .and_then(|offset| offset.checked_add(PageHeader::SIZE as u64))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "page offset calculation overflowed")
+            })
     }
 
         
