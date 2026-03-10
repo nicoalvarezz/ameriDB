@@ -85,6 +85,19 @@ impl StorageManager {
        data_file_path: impl AsRef<Path>,
        page_size: usize,
     ) -> io::Result<Self> {
+         if page_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "page size must be greater than 0",
+            ));
+        }
+        if page_size > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "page size exceeds u32::MAX and cannot be serialized",
+            ));
+        }
+
         let path = data_file_path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .read(true)
@@ -110,7 +123,7 @@ impl StorageManager {
             if header.magic != DB_MAGIC {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Invalide datbaase header magic",
+                    "Invalid datbaase header magic",
                 ));
             }
 
@@ -218,8 +231,6 @@ impl StorageManager {
 
 #[cfg(test)]
 mod tests {
-    use std::env::temp_dir;
-
     use super::*;
     use tempfile::tempdir;
 
@@ -293,6 +304,148 @@ mod tests {
         let read_page = new_manager.read_page(page_id)?;
 
         assert_eq!(&read_page.data[0..5], b"hello");
+
+        Ok(())
+    }
+
+    #[test]
+    fn storage_manager_reopen_recovers_next_page_id() -> io::Result<()> {
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().join("test.db");
+
+        {
+            let mut manager = StorageManager::open(&path, PAGE_SIZE)?;
+            manager.allocate_page()?;
+            manager.allocate_page()?;
+            manager.allocate_page()?;
+            manager.sync_all()?;
+        }
+
+        let mut reopened = StorageManager::open(&path, PAGE_SIZE)?;
+        let next = reopened.allocate_page()?;
+
+        assert_eq!(next.0, 3);
+        assert_eq!(reopened.next_page_id.0, 4);
+
+        Ok(())
+    }
+    
+    #[test]
+    fn storage_manager_write_beyond_allocated_fails() -> io::Result<()> {
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().join("test.db");
+
+        let mut manager = StorageManager::open(path, PAGE_SIZE)?;
+        let page = Page::new(PageId(1), PAGE_SIZE); 
+
+        let err = manager
+            .write_page(&page)
+            .expect_err("writing beyond allocated page range should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "cannot write to an unallocated page id");
+        
+        Ok(())   
+    }
+
+    #[test]
+    fn storage_manager_open_fails_on_zero_page_size() -> io::Result<()> {
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().join("test.db");
+
+        let err = StorageManager::open(path, 0)
+            .expect_err("opening file with 0 page size should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    
+        Ok(())
+    }
+
+    #[test]
+    fn storage_manager_open_fails_on_ivalid_magic() -> io::Result<()> {
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().join("test.db"); 
+        
+        let mut buf = [0u8; PageHeader::SIZE];
+        buf[0..4].copy_from_slice(&[0u8; 4]);
+        std::fs::File::create(&path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)?;
+        std::fs::File::write_at(&file, &buf, 0)?;
+
+        let err = StorageManager::open(path, PAGE_SIZE)
+            .expect_err("opening file with invalid magic should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "Invalid datbaase header magic");
+        
+        Ok(())
+    }
+
+    #[test]
+    fn storage_manager_open_fails_on_unsupported_version() -> io::Result<()> {
+        let tem_dir = tempdir()?;
+        let path = tem_dir.path().join("test.db");
+
+        let mut buf = [0u8; PageHeader::SIZE];
+        buf[0..4].copy_from_slice(&DB_MAGIC);
+        buf[4..6].copy_from_slice(&[0u8; 2]);
+        std::fs::File::create(&path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)?;
+        std::fs::File::write_at(&file, &buf, 0)?;
+
+        let err = StorageManager::open(path, PAGE_SIZE)
+            .expect_err("opening file with invalid version should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "unsuported database version");
+
+        Ok(())
+    }
+
+    #[test]
+    fn storage_manager_sync_all_updates_file_metadata() -> io::Result<()> {
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().join("test.db");
+        
+        // Fres open - file is small
+        let mut manager = StorageManager::open(&path, PAGE_SIZE)?;
+        let initial_len = manager.file.metadata()?.len();
+        assert!(initial_len <= PageHeader::SIZE as u64);
+
+        // Allocate + write something
+        let page_id = manager.allocate_page()?;
+        let mut page = manager.read_page(page_id)?;
+        page.data[0..5].copy_from_slice(b"hello");
+        manager.write_page(&page)?;
+
+        // Check BEFORE sync all
+        let len_before_sync = manager.file.metadata()?.len();
+        
+        assert!(len_before_sync > initial_len);
+
+        // Force metadate + data durable
+        manager.sync_all()?;
+        
+        // Check AFTER sync all - size MUST be updated now
+        let len_after_sync = manager.file.metadata()?.len();
+        let expected_len = PageHeader::SIZE as u64 + (page_id.0 + 1) * PAGE_SIZE as u64;
+
+        assert!(len_after_sync >= expected_len);
+
+        // Re-open the file - metadata & header must be consistent
+        drop(manager);
+        let mut reopened = StorageManager::open(path, PAGE_SIZE)?;
+        let len_after_reopen = reopened.file.metadata()?.len();
+
+        assert_eq!(len_after_reopen, len_after_sync);
+
+        // Data still readable
+        let read_back = reopened.read_page(page_id)?;
+        assert_eq!(&read_back.data[0..5], b"hello");
 
         Ok(())
     }
