@@ -79,3 +79,40 @@ impl DatabaseCluster {
         &self.cluster_dir
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use crate::storage::disk::PAGE_SIZE;
+
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn cluster_new_creates_bas_directory() -> io::Result<()> {
+        let temp_dir = tempdir()?;
+        let cluster = DatabaseCluster::new(temp_dir.path(), PAGE_SIZE)?;
+
+        assert!(cluster.cluster_dir().join("base").exists());
+        
+        Ok(())
+    }
+    
+    #[test]
+    fn cluster_open_same_db_id_returns_cached_instance() -> io::Result<()> {
+        let tem_dir = tempdir()?;
+        let cluster = DatabaseCluster::new(tem_dir.path(), PAGE_SIZE)?;
+        
+        let db_id  = DatabaseId(123);
+        let first = cluster.open_database(db_id)?;
+        let second = cluster.open_database(db_id)?;
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "opening the same database ID should return cached Arc instance"
+        );
+        assert_eq!(cluster.list_open_databses().len(), 1);
+
+        Ok(())
+    }
+}
